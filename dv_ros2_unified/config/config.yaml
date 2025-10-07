@@ -1,0 +1,43 @@
+dv_ros2_capture:
+  ros__parameters:
+    time_increment: 1000
+    # Enable or disable the capture of frames
+    frames: True
+    # Enable or disable the capture of events
+    events: True
+    # Enable or disable the capture of imu
+    imu: True
+    # Enable or disable the capture of triggers
+    triggers: True
+    # Camera name
+    camera_name: ""
+    # aedat file path for calibration
+    aedat4_file_path: ""
+    # Camera calibration file path
+    camera_calibration_file_path: ""
+    # Camera frame
+    camera_frame_name: "camera"
+    # Imu frame
+    imu_frame_name: "imu"
+    # Enable or disable transformation from imu values to camera
+    transform_imu_to_camera_frame: False
+    # Enable or disable unbiased imu values
+    unbiased_imu_data: True
+    # Enable or disable noise filtering
+    noise_filtering: True
+    # Background activity time for noise filtering
+    noise_ba_time: 2000
+    # Devices to sync (camera names)
+    sync_device_list: [""]
+    # Enable or disable waiting for synchronization
+    wait_for_sync: False
+    # Enable or disable global hold
+    global_hold: False
+    # Bias sensitivity from [0-5] 2 is the default value 0 is low and 5 is high
+    bias_sensitivity: 3
+
+    
+
+
+
+    

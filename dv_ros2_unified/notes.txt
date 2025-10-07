@@ -1,0 +1,16 @@
+Objectives:
+	1. make a container node
+	2. add a modified, composable capture node to the container
+	3. make a ros2 composable wrapper node for evflownet
+	4. test everything together with real/recorded inputs
+
+
+Remarks:
+	1. Converting non-compliant code to components requires
+		a. re-defining class signatures to comply with the Node(options) definition
+		b. removing main() definitions, as execution is moved to executor in the container node
+		c. updating launch configs (here I use .launch.py files), i.e. re-writing the script to ensure proper param-passing and enable IPC
+		d. ???
+
+Instructions:
+	1. To load an easy component: 
