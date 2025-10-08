@@ -46,12 +46,14 @@ rclcpp_components_register_nodes(visualizer_component "dv_ros2_unified::Visualiz
 # ament_target_dependencies(${PROJECT_NAME}_node ${dependencies})
 
 # target_link_libraries(${PROJECT_NAME}_core ${catkin_LIBRARIES} dv::processing)
-target_link_libraries(capture_component ${catkin_LIBRARIES} dv::processing)
-target_link_libraries(visualizer_component ${catkin_LIBRARIES} dv::processing)
+target_link_libraries(capture_component dv::processing)
+target_link_libraries(visualizer_component dv::processing)
 
 install(TARGETS
   capture_component
   visualizer_component
+  RUNTIME DESTINATION lib
+  LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
 )
 
