@@ -5,6 +5,8 @@ import argparse
 import numpy as np
 import h5py
 import cv2
+from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
 
 
 def draw_events_frame(xs, ys, ps, height, width):
@@ -41,7 +43,25 @@ def main():
         height = int(f['events'].attrs.get('height', 480))
         width = int(f['events'].attrs.get('width', 640))
 
+        # optional IMU data (angular velocities and timestamps)
+        if 'imu' in f:
+            try:
+                imu_tx = f['imu/t'][:]
+                imu_wx = f['imu/wx'][:]
+                imu_wy = f['imu/wy'][:]
+                imu_wz = f['imu/wz'][:]
+                has_imu = True
+            except Exception:
+                # missing expected imu datasets
+                has_imu = False
+                imu_tx = imu_wx = imu_wy = imu_wz = np.array([])
+        else:
+            has_imu = False
+            imu_tx = imu_wx = imu_wy = imu_wz = np.array([])
+
     print(f"Loaded {len(ex)} events from {args.h5file}; image size {width}x{height}")
+    print(f"Event timestamps from {et[0]*1e-6:.3f}s to {et[-1]*1e-6:.3f}s")
+    print(f"IMU timestamps from {imu_tx[0]*1e-6:.3f}s to {imu_tx[-1]*1e-6:.3f}s" if has_imu and imu_tx.size > 0 else "No IMU data")
 
     dt = args.dt_ms * 1000.0
     t0 = et[0] if len(et) > 0 else 0.0
@@ -51,6 +71,22 @@ def main():
     paused = False
 
     cv2.namedWindow('events', cv2.WINDOW_NORMAL)
+
+    # If IMU exists, set up a Matplotlib plot showing angular velocity and a moving time marker
+    if has_imu and imu_tx.size > 0:
+        plt.ion()
+        fig, ax = plt.subplots(3, 1, sharex=True, figsize=(7, 5))
+        ax[0].plot(imu_tx, imu_wx, color='r')
+        ax[0].set_ylabel('wx')
+        ax[1].plot(imu_tx, imu_wy, color='g')
+        ax[1].set_ylabel('wy')
+        ax[2].plot(imu_tx, imu_wz, color='b')
+        ax[2].set_ylabel('wz')
+        ax[2].set_xlabel('time (us)')
+        # vertical marker line (initial at start)
+        vlines = [ax[i].axvline(t0, color='k', lw=1) for i in range(3)]
+        fig.canvas.draw()
+        plt.show(block=False)
 
     start_t = t0
 
@@ -70,6 +106,17 @@ def main():
 
             frame = draw_events_frame(xs, ys, ps, height, width)
             cur_t = t1
+
+            # update IMU time marker if plot exists
+            if has_imu and imu_tx.size > 0:
+                for vl in vlines:
+                    vl.set_xdata(cur_t)
+                try:
+                    fig.canvas.draw_idle()
+                    fig.canvas.flush_events()
+                except Exception:
+                    # interactive backend may not be available
+                    pass
 
         cv2.imshow('events', frame)
         key = cv2.waitKey(1) & 0xFF

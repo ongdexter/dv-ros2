@@ -74,7 +74,7 @@ def parse_chunk(messages, topic_type_items):
             header = msg.header
             tstamp = header.stamp.sec + header.stamp.nanosec * 1e-9
             tstamp_us = int(tstamp * 1e6)
-            imu_t.append(tstamp)
+            imu_t.append(tstamp_us)
             imu_ax.append(msg.linear_acceleration.x)
             imu_ay.append(msg.linear_acceleration.y)
             imu_az.append(msg.linear_acceleration.z)
