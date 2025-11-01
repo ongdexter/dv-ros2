@@ -22,7 +22,7 @@ def generate_launch_description():
                         'events': True,
                         'imu': True,
                         'triggers': True,
-                        'bias_sensitivity': 2}],
+                        'bias_sensitivity': 1}],
                     extra_arguments=[{'use_intra_process_comms': True}]),
                 ComposableNode(
                     package='rosbag2_composable_recorder',
