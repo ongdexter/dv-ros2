@@ -263,17 +263,11 @@ def parallel_parse_bag(input_path, output_path, chunk_size=100, max_cores=10):
     topics = reader.get_all_topics_and_types()
     topic_type = {t.name: t.type for t in topics}
 
-    # Read all messages into memory
-    all_messages = []
-    while reader.has_next():
-        all_messages.append(reader.read_next())
-
-    num_chunks = math.ceil(len(all_messages) / chunk_size)
-
-    print(f"Total messages: {len(all_messages)}, processing in {num_chunks} chunks of up to {chunk_size} messages each")
-
-    # For ProcessPoolExecutor, send topic_type as list of items (serializable)
+    # We'll stream messages in chunks from the reader and submit parse jobs
+    # in batches to avoid holding all messages/results in memory.
     topic_type_items = list(topic_type.items())
+    chunk_index = 0
+    print(f"Streaming messages and processing in chunks of up to {chunk_size} messages")
 
     # Create HDF5 file and datasets upfront with resizable dimensions
     # Use optimizations: chunking, compression, and larger write buffers
@@ -351,159 +345,182 @@ def parallel_parse_bag(input_path, output_path, chunk_size=100, max_cores=10):
         # Use ProcessPoolExecutor for multi-core processing
         with concurrent.futures.ProcessPoolExecutor(max_workers=max_cores) as executor:
             futures = []
-            for i in range(num_chunks):
-                chunk = all_messages[i * chunk_size:(i + 1) * chunk_size]
+            flush_interval = 10  # Flush every N chunks instead of every chunk
+
+            # Stream reader -> submit -> consume in-order when batch full
+            while True:
+                # build one chunk from the reader
+                chunk = []
+                for _ in range(chunk_size):
+                    if not reader.has_next():
+                        break
+                    chunk.append(reader.read_next())
+
+                if not chunk:
+                    break
+
+                # submit the chunk for parsing
                 futures.append(executor.submit(parse_chunk, chunk, topic_type_items))
 
-            # Process results in order to maintain strict data ordering
-            flush_interval = 10  # Flush every N chunks instead of every chunk
-            for i, future in enumerate(futures):
+                # when we have max_cores futures queued, process them in order
+                if len(futures) >= max_cores:
+                    for future in futures:
+                        res = future.result()
+
+                        # events
+                        res_events_x = res_events_y = res_events_t = res_events_p = None
+                        if 'events' in res:
+                            (res_events_x, res_events_y, res_events_t, res_events_p) = res['events']
+
+                        # imu
+                        res_imu_t = None
+                        res_imu_ax = res_imu_ay = res_imu_az = res_imu_wx = res_imu_wy = res_imu_wz = None
+                        if 'imu' in res:
+                            (res_imu_t, res_imu_ax, res_imu_ay, res_imu_az, res_imu_wx, res_imu_wy, res_imu_wz) = res['imu']
+
+                        # images neuro
+                        res_images_neuro_t = res_images_neuro_h = res_images_neuro_w = res_images_neuro_encoding = res_images_neuro_data = None
+                        if 'neuro_images' in res:
+                            (res_images_neuro_t, res_images_neuro_h, res_images_neuro_w, res_images_neuro_encoding, res_images_neuro_data) = res['neuro_images']
+
+                        # images flow
+                        res_images_flow_t = res_images_flow_h = res_images_flow_w = res_images_flow_encoding = res_images_flow_data = None
+                        if 'flow_images' in res:
+                            (res_images_flow_t, res_images_flow_h, res_images_flow_w, res_images_flow_encoding, res_images_flow_data) = res['flow_images']
+
+                        # odometry
+                        res_vicon = None
+                        res_zed = None
+                        if 'vicon_odom' in res:
+                            res_vicon = res['vicon_odom']
+                        if 'zed_odom' in res:
+                            res_zed = res['zed_odom']
+
+                        # Append events data incrementally
+                        if res_events_x:
+                            current_events_size = events_grp['x'].shape[0]
+                            new_events_size = current_events_size + len(res_events_x)
+                            
+                            events_grp['x'].resize((new_events_size,))
+                            events_grp['y'].resize((new_events_size,))
+                            events_grp['t'].resize((new_events_size,))
+                            events_grp['p'].resize((new_events_size,))
+                            
+                            events_grp['x'][current_events_size:new_events_size] = res_events_x
+                            events_grp['y'][current_events_size:new_events_size] = res_events_y
+                            events_grp['t'][current_events_size:new_events_size] = res_events_t
+                            events_grp['p'][current_events_size:new_events_size] = res_events_p
+
+                        # Append IMU data incrementally
+                        if res_imu_t:
+                            current_imu_size = imu_grp['t'].shape[0]
+                            new_imu_size = current_imu_size + len(res_imu_t)
+                            
+                            imu_grp['t'].resize((new_imu_size,))
+                            imu_grp['ax'].resize((new_imu_size,))
+                            imu_grp['ay'].resize((new_imu_size,))
+                            imu_grp['az'].resize((new_imu_size,))
+                            imu_grp['wx'].resize((new_imu_size,))
+                            imu_grp['wy'].resize((new_imu_size,))
+                            imu_grp['wz'].resize((new_imu_size,))
+                            
+                            imu_grp['t'][current_imu_size:new_imu_size] = res_imu_t
+                            imu_grp['ax'][current_imu_size:new_imu_size] = res_imu_ax
+                            imu_grp['ay'][current_imu_size:new_imu_size] = res_imu_ay
+                            imu_grp['az'][current_imu_size:new_imu_size] = res_imu_az
+                            imu_grp['wx'][current_imu_size:new_imu_size] = res_imu_wx
+                            imu_grp['wy'][current_imu_size:new_imu_size] = res_imu_wy
+                            imu_grp['wz'][current_imu_size:new_imu_size] = res_imu_wz
+
+                        # Append vicon odometry incrementally
+                        if res_vicon:
+                            (res_vicon_t, res_vicon_px, res_vicon_py, res_vicon_pz, res_vicon_qx, res_vicon_qy, res_vicon_qz, res_vicon_qw,
+                             res_vicon_vx, res_vicon_vy, res_vicon_vz, res_vicon_avx, res_vicon_avy, res_vicon_avz) = res_vicon
+
+                            current_vicon_size = vicon_grp['t'].shape[0]
+                            new_vicon_size = current_vicon_size + len(res_vicon_t)
+
+                            vicon_grp['t'].resize((new_vicon_size,))
+                            vicon_grp['px'].resize((new_vicon_size,))
+                            vicon_grp['py'].resize((new_vicon_size,))
+                            vicon_grp['pz'].resize((new_vicon_size,))
+                            vicon_grp['qx'].resize((new_vicon_size,))
+                            vicon_grp['qy'].resize((new_vicon_size,))
+                            vicon_grp['qz'].resize((new_vicon_size,))
+                            vicon_grp['qw'].resize((new_vicon_size,))
+                            vicon_grp['vx'].resize((new_vicon_size,))
+                            vicon_grp['vy'].resize((new_vicon_size,))
+                            vicon_grp['vz'].resize((new_vicon_size,))
+                            vicon_grp['avx'].resize((new_vicon_size,))
+                            vicon_grp['avy'].resize((new_vicon_size,))
+                            vicon_grp['avz'].resize((new_vicon_size,))
+
+                            vicon_grp['t'][current_vicon_size:new_vicon_size] = res_vicon_t
+                            vicon_grp['px'][current_vicon_size:new_vicon_size] = res_vicon_px
+                            vicon_grp['py'][current_vicon_size:new_vicon_size] = res_vicon_py
+                            vicon_grp['pz'][current_vicon_size:new_vicon_size] = res_vicon_pz
+                            vicon_grp['qx'][current_vicon_size:new_vicon_size] = res_vicon_qx
+                            vicon_grp['qy'][current_vicon_size:new_vicon_size] = res_vicon_qy
+                            vicon_grp['qz'][current_vicon_size:new_vicon_size] = res_vicon_qz
+                            vicon_grp['qw'][current_vicon_size:new_vicon_size] = res_vicon_qw
+                            vicon_grp['vx'][current_vicon_size:new_vicon_size] = res_vicon_vx
+                            vicon_grp['vy'][current_vicon_size:new_vicon_size] = res_vicon_vy
+                            vicon_grp['vz'][current_vicon_size:new_vicon_size] = res_vicon_vz
+                            vicon_grp['avx'][current_vicon_size:new_vicon_size] = res_vicon_avx
+                            vicon_grp['avy'][current_vicon_size:new_vicon_size] = res_vicon_avy
+                            vicon_grp['avz'][current_vicon_size:new_vicon_size] = res_vicon_avz
+
+                        # Append zed odometry incrementally
+                        if res_zed:
+                            (res_zed_t, res_zed_px, res_zed_py, res_zed_pz, res_zed_qx, res_zed_qy, res_zed_qz, res_zed_qw,
+                             res_zed_vx, res_zed_vy, res_zed_vz, res_zed_avx, res_zed_avy, res_zed_avz) = res_zed
+
+                            current_zed_size = zed_grp['t'].shape[0]
+                            new_zed_size = current_zed_size + len(res_zed_t)
+
+                            zed_grp['t'].resize((new_zed_size,))
+                            zed_grp['px'].resize((new_zed_size,))
+                            zed_grp['py'].resize((new_zed_size,))
+                            zed_grp['pz'].resize((new_zed_size,))
+                            zed_grp['qx'].resize((new_zed_size,))
+                            zed_grp['qy'].resize((new_zed_size,))
+                            zed_grp['qz'].resize((new_zed_size,))
+                            zed_grp['qw'].resize((new_zed_size,))
+                            zed_grp['vx'].resize((new_zed_size,))
+                            zed_grp['vy'].resize((new_zed_size,))
+                            zed_grp['vz'].resize((new_zed_size,))
+                            zed_grp['avx'].resize((new_zed_size,))
+                            zed_grp['avy'].resize((new_zed_size,))
+                            zed_grp['avz'].resize((new_zed_size,))
+
+                            zed_grp['t'][current_zed_size:new_zed_size] = res_zed_t
+                            zed_grp['px'][current_zed_size:new_zed_size] = res_zed_px
+                            zed_grp['py'][current_zed_size:new_zed_size] = res_zed_py
+                            zed_grp['pz'][current_zed_size:new_zed_size] = res_zed_pz
+                            zed_grp['qx'][current_zed_size:new_zed_size] = res_zed_qx
+                            zed_grp['qy'][current_zed_size:new_zed_size] = res_zed_qy
+                            zed_grp['qz'][current_zed_size:new_zed_size] = res_zed_qz
+                            zed_grp['qw'][current_zed_size:new_zed_size] = res_zed_qw
+                            zed_grp['vx'][current_zed_size:new_zed_size] = res_zed_vx
+                            zed_grp['vy'][current_zed_size:new_zed_size] = res_zed_vy
+                            zed_grp['vz'][current_zed_size:new_zed_size] = res_zed_vz
+                            zed_grp['avx'][current_zed_size:new_zed_size] = res_zed_avx
+                            zed_grp['avy'][current_zed_size:new_zed_size] = res_zed_avy
+                            zed_grp['avz'][current_zed_size:new_zed_size] = res_zed_avz
+
+                        # Flush to disk periodically instead of every chunk
+                        chunk_index += 1
+                        if (chunk_index) % flush_interval == 0:
+                            h5f.flush()
+                            print(f"Written {chunk_index} chunks to disk (flushed)")
+
+                    # free the futures list and continue streaming
+                    futures = []
+                    continue
+
+            # process any remaining futures after stream end
+            for future in futures:
                 res = future.result()
-                # events
-                res_events_x = res_events_y = res_events_t = res_events_p = None
-                if 'events' in res:
-                    (res_events_x, res_events_y, res_events_t, res_events_p) = res['events']
-
-                # imu
-                res_imu_t = None
-                res_imu_ax = res_imu_ay = res_imu_az = res_imu_wx = res_imu_wy = res_imu_wz = None
-                if 'imu' in res:
-                    (res_imu_t, res_imu_ax, res_imu_ay, res_imu_az, res_imu_wx, res_imu_wy, res_imu_wz) = res['imu']
-
-                # images neuro
-                res_images_neuro_t = res_images_neuro_h = res_images_neuro_w = res_images_neuro_encoding = res_images_neuro_data = None
-                if 'neuro_images' in res:
-                    (res_images_neuro_t, res_images_neuro_h, res_images_neuro_w, res_images_neuro_encoding, res_images_neuro_data) = res['neuro_images']
-
-                # images flow
-                res_images_flow_t = res_images_flow_h = res_images_flow_w = res_images_flow_encoding = res_images_flow_data = None
-                if 'flow_images' in res:
-                    (res_images_flow_t, res_images_flow_h, res_images_flow_w, res_images_flow_encoding, res_images_flow_data) = res['flow_images']
-
-                # odometry
-                res_vicon = None
-                res_zed = None
-                if 'vicon_odom' in res:
-                    res_vicon = res['vicon_odom']
-                if 'zed_odom' in res:
-                    res_zed = res['zed_odom']
-
-                # Append events data incrementally
-                if res_events_x:
-                    current_events_size = events_grp['x'].shape[0]
-                    new_events_size = current_events_size + len(res_events_x)
-                    
-                    events_grp['x'].resize((new_events_size,))
-                    events_grp['y'].resize((new_events_size,))
-                    events_grp['t'].resize((new_events_size,))
-                    events_grp['p'].resize((new_events_size,))
-                    
-                    events_grp['x'][current_events_size:new_events_size] = res_events_x
-                    events_grp['y'][current_events_size:new_events_size] = res_events_y
-                    events_grp['t'][current_events_size:new_events_size] = res_events_t
-                    events_grp['p'][current_events_size:new_events_size] = res_events_p
-
-                # Append IMU data incrementally
-                if res_imu_t:
-                    current_imu_size = imu_grp['t'].shape[0]
-                    new_imu_size = current_imu_size + len(res_imu_t)
-                    
-                    imu_grp['t'].resize((new_imu_size,))
-                    imu_grp['ax'].resize((new_imu_size,))
-                    imu_grp['ay'].resize((new_imu_size,))
-                    imu_grp['az'].resize((new_imu_size,))
-                    imu_grp['wx'].resize((new_imu_size,))
-                    imu_grp['wy'].resize((new_imu_size,))
-                    imu_grp['wz'].resize((new_imu_size,))
-                    
-                    imu_grp['t'][current_imu_size:new_imu_size] = res_imu_t
-                    imu_grp['ax'][current_imu_size:new_imu_size] = res_imu_ax
-                    imu_grp['ay'][current_imu_size:new_imu_size] = res_imu_ay
-                    imu_grp['az'][current_imu_size:new_imu_size] = res_imu_az
-                    imu_grp['wx'][current_imu_size:new_imu_size] = res_imu_wx
-                    imu_grp['wy'][current_imu_size:new_imu_size] = res_imu_wy
-                    imu_grp['wz'][current_imu_size:new_imu_size] = res_imu_wz
-
-                # Append vicon odometry incrementally
-                if res_vicon:
-                    (res_vicon_t, res_vicon_px, res_vicon_py, res_vicon_pz, res_vicon_qx, res_vicon_qy, res_vicon_qz, res_vicon_qw,
-                     res_vicon_vx, res_vicon_vy, res_vicon_vz, res_vicon_avx, res_vicon_avy, res_vicon_avz) = res_vicon
-
-                    current_vicon_size = vicon_grp['t'].shape[0]
-                    new_vicon_size = current_vicon_size + len(res_vicon_t)
-
-                    vicon_grp['t'].resize((new_vicon_size,))
-                    vicon_grp['px'].resize((new_vicon_size,))
-                    vicon_grp['py'].resize((new_vicon_size,))
-                    vicon_grp['pz'].resize((new_vicon_size,))
-                    vicon_grp['qx'].resize((new_vicon_size,))
-                    vicon_grp['qy'].resize((new_vicon_size,))
-                    vicon_grp['qz'].resize((new_vicon_size,))
-                    vicon_grp['qw'].resize((new_vicon_size,))
-                    vicon_grp['vx'].resize((new_vicon_size,))
-                    vicon_grp['vy'].resize((new_vicon_size,))
-                    vicon_grp['vz'].resize((new_vicon_size,))
-                    vicon_grp['avx'].resize((new_vicon_size,))
-                    vicon_grp['avy'].resize((new_vicon_size,))
-                    vicon_grp['avz'].resize((new_vicon_size,))
-
-                    vicon_grp['t'][current_vicon_size:new_vicon_size] = res_vicon_t
-                    vicon_grp['px'][current_vicon_size:new_vicon_size] = res_vicon_px
-                    vicon_grp['py'][current_vicon_size:new_vicon_size] = res_vicon_py
-                    vicon_grp['pz'][current_vicon_size:new_vicon_size] = res_vicon_pz
-                    vicon_grp['qx'][current_vicon_size:new_vicon_size] = res_vicon_qx
-                    vicon_grp['qy'][current_vicon_size:new_vicon_size] = res_vicon_qy
-                    vicon_grp['qz'][current_vicon_size:new_vicon_size] = res_vicon_qz
-                    vicon_grp['qw'][current_vicon_size:new_vicon_size] = res_vicon_qw
-                    vicon_grp['vx'][current_vicon_size:new_vicon_size] = res_vicon_vx
-                    vicon_grp['vy'][current_vicon_size:new_vicon_size] = res_vicon_vy
-                    vicon_grp['vz'][current_vicon_size:new_vicon_size] = res_vicon_vz
-                    vicon_grp['avx'][current_vicon_size:new_vicon_size] = res_vicon_avx
-                    vicon_grp['avy'][current_vicon_size:new_vicon_size] = res_vicon_avy
-                    vicon_grp['avz'][current_vicon_size:new_vicon_size] = res_vicon_avz
-
-                # Append zed odometry incrementally
-                if res_zed:
-                    (res_zed_t, res_zed_px, res_zed_py, res_zed_pz, res_zed_qx, res_zed_qy, res_zed_qz, res_zed_qw,
-                     res_zed_vx, res_zed_vy, res_zed_vz, res_zed_avx, res_zed_avy, res_zed_avz) = res_zed
-
-                    current_zed_size = zed_grp['t'].shape[0]
-                    new_zed_size = current_zed_size + len(res_zed_t)
-
-                    zed_grp['t'].resize((new_zed_size,))
-                    zed_grp['px'].resize((new_zed_size,))
-                    zed_grp['py'].resize((new_zed_size,))
-                    zed_grp['pz'].resize((new_zed_size,))
-                    zed_grp['qx'].resize((new_zed_size,))
-                    zed_grp['qy'].resize((new_zed_size,))
-                    zed_grp['qz'].resize((new_zed_size,))
-                    zed_grp['qw'].resize((new_zed_size,))
-                    zed_grp['vx'].resize((new_zed_size,))
-                    zed_grp['vy'].resize((new_zed_size,))
-                    zed_grp['vz'].resize((new_zed_size,))
-                    zed_grp['avx'].resize((new_zed_size,))
-                    zed_grp['avy'].resize((new_zed_size,))
-                    zed_grp['avz'].resize((new_zed_size,))
-
-                    zed_grp['t'][current_zed_size:new_zed_size] = res_zed_t
-                    zed_grp['px'][current_zed_size:new_zed_size] = res_zed_px
-                    zed_grp['py'][current_zed_size:new_zed_size] = res_zed_py
-                    zed_grp['pz'][current_zed_size:new_zed_size] = res_zed_pz
-                    zed_grp['qx'][current_zed_size:new_zed_size] = res_zed_qx
-                    zed_grp['qy'][current_zed_size:new_zed_size] = res_zed_qy
-                    zed_grp['qz'][current_zed_size:new_zed_size] = res_zed_qz
-                    zed_grp['qw'][current_zed_size:new_zed_size] = res_zed_qw
-                    zed_grp['vx'][current_zed_size:new_zed_size] = res_zed_vx
-                    zed_grp['vy'][current_zed_size:new_zed_size] = res_zed_vy
-                    zed_grp['vz'][current_zed_size:new_zed_size] = res_zed_vz
-                    zed_grp['avx'][current_zed_size:new_zed_size] = res_zed_avx
-                    zed_grp['avy'][current_zed_size:new_zed_size] = res_zed_avy
-                    zed_grp['avz'][current_zed_size:new_zed_size] = res_zed_avz
-
-                # Flush to disk periodically instead of every chunk
-                if (i + 1) % flush_interval == 0 or (i + 1) == num_chunks:
-                    h5f.flush()
-                    print(f"Written chunk {i+1}/{num_chunks} to disk (flushed)")
 
                 # Append neuro images: decode bytes -> numpy arrays -> store in dataset images (N,H,W,C) and timestamps
                 def _channels_from_encoding(enc, h, w, data_len):
@@ -636,6 +653,12 @@ def parallel_parse_bag(input_path, output_path, chunk_size=100, max_cores=10):
                     flow_raw_grp['data'][cur:new] = data_list
                     flow_raw_grp['shape'][cur:new] = shape_list
                     flow_raw_grp['t'][cur:new] = res_flow_raw_t
+
+                # increment processed chunk counter and optionally flush
+                chunk_index += 1
+                if (chunk_index) % flush_interval == 0:
+                    h5f.flush()
+                    print(f"Written {chunk_index} chunks to disk (flushed)")
 
     print(f"Saved to {output_path}")
 
