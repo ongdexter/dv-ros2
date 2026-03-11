@@ -21,7 +21,7 @@ def generate_launch_description():
                         'flow_image_topic': '/flow/rgb',
                         'flow_raw_topic': '/flow/raw',
                         'frame_rate': 30.0,
-                        'engine_path': '/home/nvidia/nfu_ws/src/trt_engines/evfn_python_converted_fp16.trt',
+                        'engine_path': '/home/nvidia/nf_ws/src/trt_engines/evfn_fp16.trt',
                         'events_kept': 100_000,}],
                     extra_arguments=[{'use_intra_process_comms': True}]),
                 ComposableNode(
@@ -45,7 +45,7 @@ def generate_launch_description():
                         # 'noise_ba_time': 2000,
                         # 'wait_for_sync': False,
                         # 'global_hold': False,
-                        'bias_sensitivity': 1}],
+                        'bias_sensitivity': 3}],
                     extra_arguments=[{'use_intra_process_comms': True}]),
                 # ComposableNode(
                 #     package='dv_ros2_unified',

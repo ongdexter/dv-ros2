@@ -51,7 +51,7 @@ def generate_launch_description():
                         # 'noise_ba_time': 2000,
                         # 'wait_for_sync': False,
                         # 'global_hold': False,
-                        'bias_sensitivity': 1}],
+                        'bias_sensitivity': 3}],
                     extra_arguments=[{'use_intra_process_comms': True}]),
                 # ComposableNode(
                 #     package='dv_ros2_unified',

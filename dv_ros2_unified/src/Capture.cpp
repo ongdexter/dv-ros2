@@ -1,4 +1,115 @@
 #include "dv_ros2_unified/Capture.hpp"
+#include <algorithm>
+#include <opencv2/opencv.hpp>
+
+// helper for converting external calibration formats into the DV JSON format
+namespace {
+    bool convertOpenCvXmlToDv(const std::filesystem::path &xmlPath,
+                               const std::filesystem::path &outJsonPath,
+                               const std::string &cameraName,
+                               const rclcpp::Logger &logger)
+    {
+        cv::FileStorage fs(xmlPath.string(), cv::FileStorage::READ);
+        if (!fs.isOpened())
+        {
+            RCLCPP_ERROR(logger, "Cannot open calibration XML/YAML file [%s]", xmlPath.c_str());
+            return false;
+        }
+
+        cv::Mat camMat, distCoeffs;
+        int width = 0, height = 0;
+
+        // Try root-level keys first
+        fs["camera_matrix"] >> camMat;
+        fs["distortion_coefficients"] >> distCoeffs;
+
+        // If empty, try under the camera name node (DV SDK calibration format)
+        if (camMat.empty() || distCoeffs.empty())
+        {
+            cv::FileNode camNode = fs[cameraName];
+            if (!camNode.empty())
+            {
+                RCLCPP_INFO(logger, "Reading calibration from sub-node [%s]", cameraName.c_str());
+                camNode["camera_matrix"] >> camMat;
+                camNode["distortion_coefficients"] >> distCoeffs;
+                if (camNode["image_width"].isInt())
+                    camNode["image_width"] >> width;
+                if (camNode["image_height"].isInt())
+                    camNode["image_height"] >> height;
+            }
+        }
+
+        // Last resort: iterate over all root-level nodes to find one with camera_matrix
+        if (camMat.empty() || distCoeffs.empty())
+        {
+            cv::FileNode root = fs.root();
+            for (auto it = root.begin(); it != root.end(); ++it)
+            {
+                cv::FileNode child = *it;
+                if (child.isMap())
+                {
+                    cv::Mat tryMat;
+                    child["camera_matrix"] >> tryMat;
+                    if (!tryMat.empty())
+                    {
+                        RCLCPP_INFO(logger, "Reading calibration from sub-node [%s]", (*it).name().c_str());
+                        camMat = tryMat;
+                        child["distortion_coefficients"] >> distCoeffs;
+                        if (child["image_width"].isInt())
+                            child["image_width"] >> width;
+                        if (child["image_height"].isInt())
+                            child["image_height"] >> height;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (camMat.empty() || distCoeffs.empty())
+        {
+            RCLCPP_ERROR(logger, "Calibration file does not contain camera_matrix or distortion_coefficients");
+            return false;
+        }
+
+        // Read root-level dimensions only if not already populated from a sub-node
+        if (width == 0 && fs["image_width"].isInt())
+            fs["image_width"] >> width;
+        if (height == 0 && fs["image_height"].isInt())
+            fs["image_height"] >> height;
+
+        dv::camera::CalibrationSet calibSet;
+        dv::camera::calibrations::CameraCalibration calib;
+        calib.name = cameraName;
+        calib.resolution = cv::Size(width, height);
+        calib.focalLength = cv::Point2f(static_cast<float>(camMat.at<double>(0, 0)),
+                                        static_cast<float>(camMat.at<double>(1, 1)));
+        calib.principalPoint = cv::Point2f(static_cast<float>(camMat.at<double>(0, 2)),
+                                           static_cast<float>(camMat.at<double>(1, 2)));
+        calib.distortion.clear();
+        for (int i = 0; i < distCoeffs.total(); ++i)
+        {
+            calib.distortion.push_back(static_cast<float>(distCoeffs.at<double>(i)));
+        }
+        // assume radial‑tangential model when coming from OpenCV XML
+        calib.distortionModel = dv::camera::DistortionModel::RadTan;
+        calib.transformationToC0 = {1.f, 0.f, 0.f, 0.f,
+                                    0.f, 1.f, 0.f, 0.f,
+                                    0.f, 0.f, 1.f, 0.f,
+                                    0.f, 0.f, 0.f, 1.f};
+
+        calibSet.addCameraCalibration(calib);
+        try
+        {
+            calibSet.writeToFile(outJsonPath);
+        }
+        catch (const std::exception &e)
+        {
+            RCLCPP_ERROR(logger, "Failed to write converted calibration to [%s]: %s", outJsonPath.c_str(), e.what());
+            return false;
+        }
+        return true;
+    }
+}
 
 namespace dv_ros2_unified
 {
@@ -91,8 +202,27 @@ namespace dv_ros2_unified
             {
                 throw dv::exceptions::InvalidArgument<std::string>("User supplied calibration file does not exist!", m_params.cameraCalibrationFilePath);
             }
-            RCLCPP_INFO_STREAM(m_node->get_logger(), "Loading calibration data from [" << m_params.cameraCalibrationFilePath << "]");
-            fs::copy_file(m_params.cameraCalibrationFilePath, calibrationPath, fs::copy_options::overwrite_existing);
+
+            bool converted = false;
+            auto ext = m_params.cameraCalibrationFilePath.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".xml" || ext == ".yml" || ext == ".yaml")
+            {
+                // convert OpenCV-style XML/YAML to the dv JSON format and save to active path
+                converted = convertOpenCvXmlToDv(m_params.cameraCalibrationFilePath, calibrationPath,
+                                                 m_reader.getCameraName(), m_node->get_logger());
+                if (!converted)
+                {
+                    throw dv::exceptions::InvalidArgument<std::string>(
+                        "Failed to convert calibration file to DV format", m_params.cameraCalibrationFilePath);
+                }
+                RCLCPP_INFO_STREAM(m_node->get_logger(), "Converted XML/YAML calibration to DV format at " << calibrationPath);
+            }
+            else
+            {
+                RCLCPP_INFO_STREAM(m_node->get_logger(), "Loading calibration data from [" << m_params.cameraCalibrationFilePath << "]");
+                fs::copy_file(m_params.cameraCalibrationFilePath, calibrationPath, fs::copy_options::overwrite_existing);
+            }
         }
 
         if (fs::exists(calibrationPath))
@@ -136,7 +266,73 @@ namespace dv_ros2_unified
             }
             if (cameraCalibration.has_value())
             {
-                populateInfoMsg(cameraCalibration->getCameraGeometry());
+                const auto &geom = cameraCalibration->getCameraGeometry();
+                populateInfoMsg(geom);
+
+                if (m_params.undistortEvents)
+                {
+                    // Build rectify LUT following the same approach as the Python preprocessing:
+                    //   Knew = getOptimalNewCameraMatrix(..., alpha=0)  [or fisheye equivalent]
+                    //   undistortPoints(all_pixels, ..., Knew)  →  (H, W, 2) LUT
+                    const int W = static_cast<int>(m_camera_info_msg.width);
+                    const int H = static_cast<int>(m_camera_info_msg.height);
+                    const auto &k = m_camera_info_msg.k;
+                    cv::Mat Kdist = (cv::Mat_<double>(3,3) << k[0], k[1], k[2],
+                                                              k[3], k[4], k[5],
+                                                              k[6], k[7], k[8]);
+                    cv::Mat distCoeffs(m_camera_info_msg.d);
+
+                    // Build flat list of all pixel coordinates
+                    std::vector<cv::Point2f> pts;
+                    pts.reserve(H * W);
+                    for (int y = 0; y < H; y++)
+                    {
+                        for (int x = 0; x < W; x++)
+                        {
+                            pts.emplace_back(static_cast<float>(x), static_cast<float>(y));
+                        }
+                    }
+                    cv::Mat ptsMat(pts);  // (N, 1) CV_32FC2
+                    cv::Mat undistortedPts;
+
+                    cv::Mat Knew;
+                    const bool isFisheye = (m_camera_info_msg.distortion_model
+                                            == sensor_msgs::distortion_models::EQUIDISTANT);
+                    if (isFisheye)
+                    {
+                        cv::fisheye::estimateNewCameraMatrixForUndistortRectify(
+                            Kdist, distCoeffs, cv::Size(W, H), cv::Mat::eye(3, 3, CV_64F),
+                            Knew, 0.0);
+                        cv::fisheye::undistortPoints(
+                            ptsMat, undistortedPts, Kdist, distCoeffs,
+                            cv::Mat::eye(3, 3, CV_64F), Knew);
+                    }
+                    else
+                    {
+                        Knew = cv::getOptimalNewCameraMatrix(
+                            Kdist, distCoeffs, cv::Size(W, H), 0.0);
+                        cv::undistortPoints(
+                            ptsMat, undistortedPts, Kdist, distCoeffs,
+                            cv::noArray(), Knew);
+                    }
+
+                    // Reshape to (H, W) CV_32FC2 LUT
+                    m_undistort_map = undistortedPts.reshape(2, H);
+
+                    // Update camera_info to use Knew with zero distortion
+                    double fx_new = Knew.at<double>(0, 0);
+                    double fy_new = Knew.at<double>(1, 1);
+                    double cx_new = Knew.at<double>(0, 2);
+                    double cy_new = Knew.at<double>(1, 2);
+                    m_camera_info_msg.k = {fx_new, 0, cx_new, 0, fy_new, cy_new, 0, 0, 1};
+                    m_camera_info_msg.p = {fx_new, 0, cx_new, 0, 0, fy_new, cy_new, 0, 0, 0, 1.0, 0};
+                    std::fill(m_camera_info_msg.d.begin(), m_camera_info_msg.d.end(), 0.0);
+                    m_camera_info_msg.distortion_model = sensor_msgs::distortion_models::PLUMB_BOB;
+
+                    RCLCPP_INFO(m_node->get_logger(),
+                        "Event undistortion enabled — precomputed %dx%d rectify map, Knew: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+                        W, H, fx_new, fy_new, cx_new, cy_new);
+                }
             }
             else
             {
@@ -275,6 +471,7 @@ namespace dv_ros2_unified
         int_range.set__from_value(0).set__to_value(5).set__step(1);
         descriptor.integer_range = {int_range};
         m_node->declare_parameter("bias_sensitivity", m_params.biasSensitivity, descriptor);
+        m_node->declare_parameter("undistort_events", m_params.undistortEvents);
     }
 
     inline void Capture::parameterPrinter() const
@@ -302,6 +499,7 @@ namespace dv_ros2_unified
         RCLCPP_INFO(m_node->get_logger(), "wait_for_sync: %s", m_params.waitForSync ? "true" : "false");
         RCLCPP_INFO(m_node->get_logger(), "global_hold: %s", m_params.globalHold ? "true" : "false");
         RCLCPP_INFO(m_node->get_logger(), "bias_sensitivity: %d", m_params.biasSensitivity);
+        RCLCPP_INFO(m_node->get_logger(), "undistort_events: %s", m_params.undistortEvents ? "true" : "false");
     }
 
     inline bool Capture::readParameters()
@@ -394,6 +592,11 @@ namespace dv_ros2_unified
         if (!m_node->get_parameter("bias_sensitivity", m_params.biasSensitivity))
         {
             RCLCPP_ERROR(m_node->get_logger(), "Failed to read parameter biasSensitivity");
+            return false;
+        }
+        if (!m_node->get_parameter("undistort_events", m_params.undistortEvents))
+        {
+            RCLCPP_ERROR(m_node->get_logger(), "Failed to read parameter undistort_events");
             return false;
         }
         return true;
@@ -648,6 +851,18 @@ namespace dv_ros2_unified
                     result.reason = "bias_sensitivity must be an integer";
                 }
             }
+            else if (param.get_name() == "undistort_events")
+            {
+                if (param.get_type() == rclcpp::ParameterType::PARAMETER_BOOL)
+                {
+                    m_params.undistortEvents = param.as_bool();
+                }
+                else
+                {
+                    result.successful = false;
+                    result.reason = "undistort_events must be a boolean";
+                }
+            }
             else
             {
                 result.successful = false;
@@ -701,6 +916,39 @@ namespace dv_ros2_unified
         m_camera_info_msg.k = {fx, 0, cx, 0, fy, cy, 0, 0, 1};
         m_camera_info_msg.r = {1.0, 0, 0, 0, 1.0, 0, 0, 0, 1.0};
         m_camera_info_msg.p = {fx, 0, cx, 0, 0, fy, cy, 0, 0, 0, 1.0, 0};
+    }
+
+    dv::EventStore Capture::undistortEvents(const dv::EventStore &events)
+    {
+        if (m_undistort_map.empty())
+        {
+            return events;
+        }
+
+        const int width = m_undistort_map.cols;
+        const int height = m_undistort_map.rows;
+
+        auto packet = std::make_shared<dv::EventPacket>();
+        packet->elements.reserve(events.size());
+
+        for (const auto &event : events)
+        {
+            // O(1) LUT lookup
+            const auto &uv = m_undistort_map.at<cv::Vec2f>(event.y(), event.x());
+
+            const auto ux = static_cast<int16_t>(std::round(uv[0]));
+            const auto uy = static_cast<int16_t>(std::round(uv[1]));
+
+            // Drop events that fall outside the sensor boundary
+            if (ux < 0 || ux >= width || uy < 0 || uy >= height)
+            {
+                continue;
+            }
+
+            packet->elements.emplace_back(event.timestamp(), ux, uy, event.polarity());
+        }
+
+        return dv::EventStore(std::const_pointer_cast<const dv::EventPacket>(packet));
     }
 
     sensor_msgs::msg::Imu Capture::transformImuFrame(sensor_msgs::msg::Imu &&imu)
@@ -839,7 +1087,7 @@ namespace dv_ros2_unified
         if (live_capture)
         {
             m_synchronized = false;
-            live_capture->setDVXplorerEFPS(dv::io::CameraCapture::DVXeFPS::EFPS_CONSTANT_500);
+            live_capture->setDVXplorerEFPS(dv::io::CameraCapture::DVXeFPS::EFPS_VARIABLE_5000);
             m_sync_thread = std::thread(&Capture::synchronizationThread, this);
         }
         else 
@@ -1410,6 +1658,11 @@ namespace dv_ros2_unified
                     else 
                     {
                         store = *events;
+                    }
+
+                    if (m_params.undistortEvents)
+                    {
+                        store = undistortEvents(store);
                     }
 
                     if (m_events_publisher->get_subscription_count() > 0) 

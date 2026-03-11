@@ -27,6 +27,7 @@
 
 #include <dv-processing/visualization/events_visualizer.hpp>
 #include <dv-processing/camera/calibration_set.hpp>
+#include <dv-processing/camera/camera_geometry.hpp>
 #include <dv-processing/core/core.hpp>
 #include <dv-processing/camera/calibrations/camera_calibration.hpp>
 #include <dv-processing/noise/background_activity_noise_filter.hpp>
@@ -65,6 +66,7 @@ namespace dv_ros2_unified
         bool waitForSync = false;
         bool globalHold = false;
         int biasSensitivity = 2;
+        bool undistortEvents = false;
     };
 
     class Capture : public rclcpp::Node
@@ -135,6 +137,7 @@ namespace dv_ros2_unified
         std::atomic<int64_t> m_current_seek;
 
         dv::camera::CalibrationSet m_calibration;
+        cv::Mat m_undistort_map;  // (H, W, 2) CV_32FC2 rectify LUT: distorted pixel → undistorted pixel
 
         int64_t m_imu_time_offset = 0;
         Eigen::Vector3f m_acc_biases = Eigen::Vector3f::Zero();
@@ -216,6 +219,11 @@ namespace dv_ros2_unified
         /// @param enable Enable or disable the noise filter.
         /// @param backgroundActivityTime Time in milliseconds to consider a pixel as active.
         void updateNoiseFilter(const bool enable, const int64_t backgroundActivityTime);
+
+        /// @brief Undistort event coordinates using the stored camera geometry.
+        /// @param events Input event store with distorted coordinates.
+        /// @return New event store with undistorted (and clamped) coordinates; out-of-bounds events are dropped.
+        [[nodiscard]] dv::EventStore undistortEvents(const dv::EventStore &events);
 
         /// Handler for the camera synchronization service.
         /// @param request_header Request header.
